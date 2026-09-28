@@ -683,10 +683,11 @@ function Get-DiscordResources {
 # com texto especifico. Vesktop/Equibop/Legcord sao clientes paralelos - o user
 # perde a identidade do cliente mas nao tem plugins de Vencord perdidos.
 function Get-InjectionState($resources) {
+    if (-not $resources) { return 'Vanilla' }
+
     $svc = Get-Service -Name 'wiresock-client-service' -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -eq 'Running') { return 'Nosso' }
 
-    if (-not $resources) { return 'Vanilla' }
     $asar = Join-Path $resources 'app.asar'
     $original = Join-Path $resources '_app.asar'
 

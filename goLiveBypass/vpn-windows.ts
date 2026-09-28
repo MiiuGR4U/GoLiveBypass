@@ -644,15 +644,16 @@ try {
   $service=Get-Service -Name $name -ErrorAction SilentlyContinue
   if($service -and $service.Status -ne 'Stopped') { Stop-Service -Name $name -Force; $service.WaitForStatus('Stopped',[TimeSpan]::FromSeconds(20)) }
   if(-not $service) {
-    & ${quotePowerShell(executable)} install -start-type 3 -config ${quotePowerShell(configPath)} -log-level info -network-lock disabled
+    & ${quotePowerShell(executable)} install -start-type 2 -config ${quotePowerShell(configPath)} -log-level info -network-lock disabled
     if($LASTEXITCODE -ne 0){ throw 'Falha ao instalar o serviço WireSock' }
   }
   $info=Get-CimInstance Win32_Service -Filter "Name='$name'"
   if(-not $info){ throw 'Serviço WireSock não encontrado após instalação' }
-  $change=Invoke-CimMethod -InputObject $info -MethodName Change -Arguments @{PathName=$expected;StartMode='Manual'}
+  $change=Invoke-CimMethod -InputObject $info -MethodName Change -Arguments @{PathName=$expected;StartMode='Automatic'}
   if($change.ReturnValue -ne 0){ throw "Falha ao atualizar o perfil do serviço: $($change.ReturnValue)" }
   $actual=Get-CimInstance Win32_Service -Filter "Name='$name'"
   if($actual.PathName -cne $expected){ throw 'O serviço WireSock permaneceu com outra configuração' }
+  & sc.exe sdset $name 'D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPDTLOCRRC;;;IU)(A;;CCLCSWRPWPDTLOCRRC;;;SU)(A;;CCLCSWLOCRRC;;;S-1-5-99-0)'
   Start-Service -Name $name
   (Get-Service -Name $name).WaitForStatus('Running',[TimeSpan]::FromSeconds(20))
 } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }`;
@@ -667,6 +668,33 @@ if($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
 $child=Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '-NoProfile -NonInteractive -EncodedCommand ${encoded}'
 exit $child.ExitCode`;
     return ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(wrapper, "utf16le").toString("base64")];
+}
+
+export async function tryStartWireSockServiceNonElevated(
+    configPath: string,
+    log: WireSockLogger,
+): Promise<boolean> {
+    if (!isWindows() || process.arch !== "x64") return false;
+    const name = VPN_SERVICE_NAMES[0];
+    if (!serviceExists(name)) return false;
+    const currentCmd = serviceCommand(name);
+    if (!currentCmd || !configArgumentEquals(currentCmd, configPath)) return false;
+    if (serviceRunning(name) === true) return true;
+
+    try {
+        execFileSync("sc.exe", ["start", name], { stdio: "ignore", windowsHide: true, timeout: 10_000 });
+        for (let attempt = 0; attempt < 20; attempt++) {
+            await wait(250);
+            if (serviceRunning(name) === true) {
+                log("info", "serviço WireSock iniciado automaticamente sem elevação", { servico: name });
+                return true;
+            }
+        }
+        return false;
+    } catch (error) {
+        log("info", "tentativa de início não-elevado do WireSock ignorada", { motivo: logError(error) });
+        return false;
+    }
 }
 
 export async function startWireSockService(
@@ -692,14 +720,31 @@ export async function startWireSockService(
     fs.writeFileSync(staging, sanitized, "utf8");
     fs.renameSync(staging, target);
 
-    try {
-        execFileSync("powershell.exe", elevatedPowerShellArgs(serviceScript(executable, target)), {
-            windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000,
-        });
-    } catch (error) {
-        try { fs.rmSync(staging, { force: true }); } catch {}
-        log("error", "falha ao iniciar o serviço WireSock", { erro: logError(error) });
-        throw new Error("Não foi possível configurar/iniciar o serviço WireSock. Confira a permissão de administrador e os logs.");
+    let startedWithoutElevation = false;
+    const currentCmd = serviceCommand(VPN_SERVICE_NAMES[0]);
+    if (currentCmd && configArgumentEquals(currentCmd, target)) {
+        try {
+            execFileSync("sc.exe", ["start", VPN_SERVICE_NAMES[0]], { stdio: "ignore", windowsHide: true, timeout: 10_000 });
+            for (let i = 0; i < 20; i++) {
+                if (serviceRunning(VPN_SERVICE_NAMES[0]) === true) {
+                    startedWithoutElevation = true;
+                    break;
+                }
+                await wait(250);
+            }
+        } catch {}
+    }
+
+    if (!startedWithoutElevation) {
+        try {
+            execFileSync("powershell.exe", elevatedPowerShellArgs(serviceScript(executable, target)), {
+                windowsHide: true, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000,
+            });
+        } catch (error) {
+            try { fs.rmSync(staging, { force: true }); } catch {}
+            log("error", "falha ao iniciar o serviço WireSock", { erro: logError(error) });
+            throw new Error("Não foi possível configurar/iniciar o serviço WireSock. Confira a permissão de administrador e os logs.");
+        }
     }
 
     const inspection = inspectWireSock(target);

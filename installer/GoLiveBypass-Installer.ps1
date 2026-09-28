@@ -53,6 +53,11 @@ param(
 $script:ChannelExplicit = $PSBoundParameters.ContainsKey('Channel')
 $script:SelectedChannel = $Channel
 
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $global:OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { }
+
 Write-Host ''
 Write-Host '  GoLiveBypass para Equicord/Vencord — escolha seu canal de atualizacoes.' -ForegroundColor Cyan
 Write-Host '         Stable e a opcao recomendada: canal mais previsivel, somente releases estaveis.' -ForegroundColor DarkGray
@@ -226,7 +231,7 @@ function Invoke-Pnpm([string[]]$Arguments) {
     $anterior = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        & $command @commandArguments 2>&1
+        & $command @commandArguments 2>&1 | ForEach-Object { "$_" }
         $script:PnpmExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $anterior
@@ -707,6 +712,11 @@ function Get-InjectedPath($resources) {
         # E a leitura precisa ser UTF-8: em ASCII um caminho com acento vira "Jo??o".
         if ($item -is [IO.FileInfo] -and $item.Length -lt 65536) {
             $candidates += [IO.File]::ReadAllText($stub)
+        } elseif ($item -is [IO.DirectoryInfo]) {
+            $asarIndex = Join-Path $stub 'index.js'
+            if (Test-Path -LiteralPath $asarIndex -PathType Leaf) {
+                $candidates += [IO.File]::ReadAllText($asarIndex)
+            }
         }
     }
 
@@ -755,11 +765,13 @@ function Find-CheckoutFromInjection {
         $injected = Get-InjectedPath $resources
         if (-not $injected) { continue }
 
-        # <checkout>\dist\desktop -> <checkout>
-        $parent1 = Split-Path -Parent $injected
-        if (-not $parent1) { continue }
-        $root = Split-Path -Parent $parent1
-        if ($root -and (Test-ModCheckout $root)) { return $root }
+        # <checkout>\dist\desktop\patcher.js ou <checkout>\dist\desktop -> <checkout>
+        $current = $injected
+        for ($i = 0; $i -lt 4; $i++) {
+            $current = Split-Path -Parent $current
+            if (-not $current) { break }
+            if (Test-ModCheckout $current) { return $current }
+        }
     }
     return $null
 }
@@ -1664,7 +1676,8 @@ function Build-Mod($root) {
     Write-InstallerEvent 'info' 'installer.build' 'build' @{ mod_kind = (Get-CheckoutMod $root) }
     Push-Location -LiteralPath $root
     try {
-        if (-not (Test-Path -LiteralPath (Join-Path $root 'node_modules'))) {
+        $hasNodeModules = Test-Path -LiteralPath (Join-Path $root 'node_modules')
+        if (-not $hasNodeModules) {
             Write-Step 'Instalando dependencias (na primeira vez demora alguns minutos)'
             Invoke-Pnpm @('install') | Out-Host
             if ($script:PnpmExitCode -ne 0) { throw 'pnpm install falhou' }
@@ -1672,6 +1685,14 @@ function Build-Mod($root) {
 
         Write-Step 'Compilando'
         Invoke-Pnpm @('build') | Out-Host
+        if ($script:PnpmExitCode -ne 0 -and $hasNodeModules) {
+            Write-Step 'Compilacao inicial falhou com node_modules existente; sincronizando dependencias com pnpm install...'
+            Invoke-Pnpm @('install') | Out-Host
+            if ($script:PnpmExitCode -eq 0) {
+                Write-Step 'Recompilando apos pnpm install'
+                Invoke-Pnpm @('build') | Out-Host
+            }
+        }
         if ($script:PnpmExitCode -ne 0) { throw 'pnpm build falhou' }
     } finally {
         Pop-Location
@@ -1685,6 +1706,13 @@ function Remove-PluginSource($root) {
     Push-Location -LiteralPath $root
     try {
         Invoke-Pnpm @('build') | Out-Host
+        if ($script:PnpmExitCode -ne 0) {
+            Write-Step 'Compilacao falhou; tentando sincronizar dependencias com pnpm install...'
+            Invoke-Pnpm @('install') | Out-Host
+            if ($script:PnpmExitCode -eq 0) {
+                Invoke-Pnpm @('build') | Out-Host
+            }
+        }
         if ($script:PnpmExitCode -ne 0) { Write-Warn 'Nao consegui recompilar o mod sem o GoLiveBypass.' }
     } finally {
         Pop-Location

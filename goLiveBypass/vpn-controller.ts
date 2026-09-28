@@ -751,7 +751,15 @@ export class PluginVpnController {
 
     private async adoptActiveTunnelAtBoot(): Promise<VpnOperationResult> {
         const owner = this.readOwner();
-        const inspection = isLinux() ? linux.inspectLinuxNetworkSync(owner) : this.inspectWindows();
+        let inspection = isLinux() ? linux.inspectLinuxNetworkSync(owner) : this.inspectWindows();
+        if (isWindows() && (!inspection.reliable || !inspection.active || !inspection.owned)) {
+            if (fs.existsSync(this.serviceConfigPath) && fs.existsSync(this.profilePath)) {
+                const started = await windows.tryStartWireSockServiceNonElevated(this.serviceConfigPath, this.options.log);
+                if (started) {
+                    inspection = this.inspectWindows();
+                }
+            }
+        }
         if (!inspection.reliable) {
             this.options.log("warn", "ativação automática não confirmou o estado da VPN; ativação explícita segue disponível", { mode: "diagnostic-only" });
             return { success: false, suppressed: true, state: this.state, error: "Não foi possível confirmar o estado da VPN no boot." };

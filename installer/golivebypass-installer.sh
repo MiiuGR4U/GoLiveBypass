@@ -953,7 +953,7 @@ injected_flatpak_id() {
 # <checkout>/dist/desktop, que e a forma mais confiavel de achar o checkout.
 injected_path() {
     local resources="$1" file text match
-    for file in "$resources/app/index.js" "$resources/app.asar"; do
+    for file in "$resources/app/index.js" "$resources/app.asar/index.js" "$resources/app.asar"; do
         [ -f "$file" ] || continue
         [ "$(stat -c%s "$file" 2>/dev/null || echo 0)" -lt 65536 ] || continue
         text="$(tr -d '\0' < "$file" 2>/dev/null || true)"
@@ -1006,12 +1006,16 @@ EOF
 }
 
 checkout_from_injection() {
-    local resources path root
+    local resources path current i
     while IFS= read -r resources; do
         path="$(injected_path "$resources" || true)"
         [ -n "$path" ] || continue
-        root="$(dirname "$(dirname "$path")")"   # <checkout>/dist/desktop -> <checkout>
-        if is_checkout "$root"; then printf '%s\n' "$root"; return 0; fi
+        current="$path"
+        for i in 1 2 3 4; do
+            current="$(dirname "$current")"
+            [ -n "$current" ] && [ "$current" != "/" ] && [ "$current" != "." ] || break
+            if is_checkout "$current"; then printf '%s\n' "$current"; return 0; fi
+        done
     done <<EOF
 $(discord_resources)
 EOF
@@ -1463,13 +1467,25 @@ build_mod() {
     local root="$1"
     GLB_PHASE="build"
     installer_log info installer.build build mod_kind "$(checkout_mod "$root")"
+    local had_modules=0
     if [ ! -d "$root/node_modules" ]; then
         step "Instalando dependencias (na primeira vez demora alguns minutos)"
         (cd "$root" && pnpm install) || fail "pnpm install falhou"
+    else
+        had_modules=1
     fi
 
     step "Compilando"
-    (cd "$root" && pnpm build) || fail "pnpm build falhou"
+    if ! (cd "$root" && pnpm build); then
+        if [ "$had_modules" -eq 1 ]; then
+            step "Compilacao inicial falhou com node_modules existente; sincronizando dependencias com pnpm install..."
+            (cd "$root" && pnpm install) || fail "pnpm install falhou"
+            step "Recompilando apos pnpm install"
+            (cd "$root" && pnpm build) || fail "pnpm build falhou"
+        else
+            fail "pnpm build falhou"
+        fi
+    fi
 }
 remove_plugin_source() {
     local root="$1" target="$1/src/userplugins/$PLUGIN_DIR_NAME"
@@ -1478,7 +1494,10 @@ remove_plugin_source() {
     rm -rf "$target"
     # O loader do mod permanece apontando para o checkout; recompilar remove
     # somente o userplugin e não desfaz Vencord/Equicord do app.asar.
-    (cd "$root" && pnpm build) || warn "Nao consegui recompilar o mod sem o GoLiveBypass."
+    if ! (cd "$root" && pnpm build); then
+        step "Compilacao falhou; sincronizando dependencias com pnpm install..."
+        (cd "$root" && pnpm install && pnpm build) || warn "Nao consegui recompilar o mod sem o GoLiveBypass."
+    fi
 }
 
 # Patch direto em UM cliente paralelo (Equibop/Vesktop/Legcord) com source local.
